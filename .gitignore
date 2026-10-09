@@ -1,0 +1,4 @@
+bin/
+logs/
+runs/
+config.sh

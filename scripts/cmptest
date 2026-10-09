@@ -1,0 +1,211 @@
+#!/bin/bash
+# CMP 170HX test suite: one command per test (install.sh links these names into ~/.local/bin):
+#   cmp-identity                card identity + full-memory check (nvidia-smi / lspci, no load)
+#   cmp-hbm-test [minutes=10]   HBM step test (vram-memtest, walking bit -> random, all free VRAM)
+#   cmp-tensor-test [s=300]     tensor-core exactness on every SM (tc-stress)
+#   cmp-sm-test                 SM bit-exact check vs a known-good baseline (sm-verify)
+#   cmp-ai-test                 a GGUF model on this card: answer + byte-for-byte weight readback
+#   cmp-hbm-map [minutes=5]     diagnostic for a FAILING card: where do HBM errors land? (hbm-map)
+#   cmp-kernel-check            kernel log: GPU errors (Xid) since the first test today
+#   cmp-summary                 table of every test run today on this card
+# Each GPU test runs under scripts/guard.sh (stops at 72C core / 85C HBM) on the card under test only
+# (the single CMP 170HX in the PC, or SERIAL=...). Raw output: runs/<serial>-<date>/ (see config.example.sh).
+set -u
+source "$(dirname "$(readlink -f "$0")")/common.sh"
+cmd=$(basename "$0"); [[ $cmd == cmptest ]] && { cmd=cmp-${1:-}; shift; }
+case $cmd in cmp-identity|cmp-hbm-test|cmp-tensor-test|cmp-sm-test|cmp-ai-test|cmp-hbm-map|cmp-kernel-check|cmp-summary) ;;
+    *) sed -n '2,12p' "$0"; exit 2 ;; esac
+find_card || exit 1
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$CARD_IDX GPU_LIMIT=${GPU_LIMIT:-72} MEM_LIMIT=${MEM_LIMIT:-85}
+RUN=$RUNS_DIR/$CARD_SERIAL-$(date +%Y%m%d); mkdir -p "$RUN"
+[[ -f $RUN/.start ]] || date '+%Y-%m-%d %H:%M:%S' > "$RUN/.start"
+START=$(cat "$RUN/.start"); STAMP=$(date +%H%M%S)
+MODEL=${CMP_MODEL:-}; EXPECT=${CMP_EXPECT:-" Paris"}
+safety="guard.sh stops the test at ${GPU_LIMIT}°C core / ${MEM_LIMIT}°C HBM${BLOWER_TACH:+, or if the blower stalls}"
+cardline="NVIDIA CMP 170HX  SN $CARD_SERIAL  PCI $CARD_BDF"
+
+record() { printf '%s\t%s\t%s\t%s\n' "$(date +%H:%M:%S)" "$1" "$2" "$3" >> "$RUN/results.tsv"; }
+need() { [[ -x $BIN/$1 ]] || { echo "${RED}$BIN/$1 is missing - run make${2:+ $2} in $ROOT${N}"; exit 1; }; }
+stopped=0; GP=""
+# Ctrl+C: stop only THIS test's program. guard.sh starts it with setsid, so it is the guard child that
+# leads its own session; same-named processes elsewhere and the output logger are left alone.
+on_int() { stopped=1; warn_banner "Ctrl+C - stopping the test" STOPPED
+           [[ -n $GP ]] && ps -o pid=,sid= --ppid "$GP" | awk '$1 == $2 { print $1 }' | xargs -r kill -TERM; }
+trap on_int INT
+# run <logfile> <guard-name> <max-s> <command...>: live output, also saved to $RUN/<logfile>; sets RC.
+# guard runs as a background job (immune to Ctrl+C), so it outlives a stop and prints its summary.
+run() {
+    local log=$RUN/$1 name=$2 maxs=$3; shift 3
+    ( cd "$BIN" && exec "$ROOT/scripts/guard.sh" "$name" "$maxs" "$@" ) > >(tee -i "$log") 2>&1 &
+    GP=$!; wait $GP; RC=$?
+    while kill -0 $GP 2>/dev/null; do wait $GP; RC=$?; done
+    sleep 0.5
+}
+peaks() { grep -ohE 'peak GPU [0-9]+C, peak HBM [0-9]+C' "$RUN/$1" | tail -1 | sed 's/peak GPU /peak core /'; }
+stopreason() { grep -ohE 'guard: STOPPING \(.*\)' "$RUN/$1" | tail -1; }
+was_stopped() {   # after a Ctrl+C: record STOPPED with the last progress line, then exit
+    (( stopped )) || return 0
+    local last; last=$(grep -E 't= *[0-9]+s' "$RUN/$2" | tail -1 | sed 's/^ *//; s/  */ /g')
+    record "$1" STOPPED "stopped by operator; last: ${last:-none}"; exit 0
+}
+now() { date '+%d %b %Y  %H:%M:%S'; }
+
+case $cmd in
+# ------------------------------------------------------------------------------------------------
+cmp-identity)
+    box "CARD IDENTITY AND MEMORY CONFIGURATION" "$(now)" \
+        "What it does|Reads the card's identity from the NVIDIA driver (nvidia-smi) and the PCI bus (lspci): serial number, UUID, firmware (VBIOS), memory size and PCIe link. No load on the card. The serial printed here should match the sticker on the card." \
+        "Pass if|It reports as an NVIDIA CMP 170HX with its full unlocked memory (65536 MiB for the 8 GB board 10de:20c2, 40960 MiB for the 10 GB board 10de:2082) and the kernel log holds no GPU errors (Xid) for it since boot." \
+        "Commands|nvidia-smi --query-gpu=...;  lspci -nn -s $CARD_BDF;  journalctl -k -b | grep Xid"
+    log=$RUN/identity-$STAMP.txt
+    IFS=',' read -r q_name q_ser q_uuid q_vb q_mem q_mclk q_pl q_drv q_lg q_lw q_lgm q_lwm < <(nvidia-smi -i "$CARD_IDX" --format=csv,noheader \
+        --query-gpu=name,serial,uuid,vbios_version,memory.total,clocks.max.memory,power.limit,driver_version,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max)
+    xs=$(xid_count)
+    {
+    printf " %-24s ${B}%s${N}\n" "Model:" "${q_name# }" "Serial number:" "${q_ser# }" "UUID:" "${q_uuid# }" "VBIOS:" "${q_vb# }" \
+        "Memory total:" "${q_mem# }" "HBM clock (max):" "${q_mclk# }" "Power limit:" "${q_pl# }" "Driver:" "${q_drv# }" \
+        "PCIe link (now / max):" "Gen${q_lg# } x${q_lw# } / Gen${q_lgm# } x${q_lwm# }" "PCI address:" "$CARD_BDF ($CARD_SLOT)" \
+        "Kernel GPU errors (Xid):" "$xs since boot"
+    printf " %-24s %s\n" "lspci:" "$(lspci -nn -s "$CARD_BDF" | sed 's/ (rev .*//')"
+    printf " %-24s %s\n" "Other CMP 170HX cards:" "$(( $(nvidia-smi --query-gpu=name --format=csv,noheader | grep -c 'CMP 170HX') - 1 ))"
+    printf "\n ${DIM}Test programs (sha256, first 16 hex digits):${N}\n"
+    for f in vram-memtest tc-stress sm-verify weight-readback hbm-map; do
+        [[ -x $BIN/$f ]] && printf " ${DIM}  %-18s %s${N}\n" "$f" "$(sha256sum "$BIN/$f" | cut -c1-16)"
+    done
+    } | tee "$log"
+    want=65536; [[ $CARD_DEVID == 0x2082 ]] && want=40960; memv=${q_mem//[^0-9]/}
+    if [[ ${q_name# } == *"CMP 170HX"* && $memv == "$want" && $xs == 0 ]]; then
+        pass_banner "CMP 170HX SN ${q_ser# }, $memv MiB, Gen${q_lg# } x${q_lw# }, no kernel GPU errors"; record identity PASS "$memv MiB, Gen${q_lg# } x${q_lw# }"
+    else
+        fail_banner "expected a CMP 170HX with $want MiB and 0 Xid; got ${q_name# }, $memv MiB, $xs Xid"; record identity FAIL "$memv MiB, $xs Xid"
+        (( memv < want )) && warn_banner "memory is not unlocked - these tests are meant for the unlocked configuration" NOTE
+    fi
+    (( ${q_lw# } < 16 )) && warn_banner "PCIe x${q_lw# }: stock boards miss the AC-coupling caps on lanes 4-15 (the 'cap mod' restores x16); HBM tests are unaffected" NOTE
+    ;;
+# ------------------------------------------------------------------------------------------------
+cmp-hbm-test)
+    m=${1:-10}; need vram-memtest
+    box "HBM STEP TEST  (memory test, $m min)" "$(now)" \
+        "Card|$cardline" \
+        "What it does|Takes all free VRAM but 1 GB in 1 GB chunks, then repeats: write a walking-bit pattern to every 32-bit word and read every word back to compare, then the same with pseudo-random data at full bandwidth. The jump from the light pattern to full-bandwidth random data is a load step that makes marginal HBM fail fast (a known-bad card failed within its first second, every run)." \
+        "Pass if|0 errors for the whole run (\"RESULT: PASS\"). Any wrong word is printed with its address, the value read and the value expected." \
+        "Output|a status line every 50 rounds (round, pattern, time, errors so far) and on every round with errors; each round checks all allocated VRAM" \
+        "Safety|$safety" \
+        "Command|vram-memtest $m 0 1024 40   (minutes, pause s, MiB left free, pattern order: 4 = walking bit, 0 = random)" \
+        "Source|src/vram-memtest.cu"
+    f=hbm-test-$STAMP.txt
+    run "$f" hbm-test $((m * 60 + 240)) ./vram-memtest "$m" 0 1024 40
+    was_stopped "HBM step test ${m}m" "$f"
+    sum=$(grep -E '^rounds' "$RUN/$f" | tail -1)
+    if grep -q 'RESULT: PASS' "$RUN/$f"; then pass_banner "HBM step test: $sum"; record "HBM step test ${m}m" PASS "${sum#rounds }, $(peaks "$f")"
+    else fail_banner "HBM step test: ${sum:-no result} $(stopreason "$f")"; record "HBM step test ${m}m" FAIL "${sum:-no result} $(stopreason "$f")"; fi
+    ;;
+# ------------------------------------------------------------------------------------------------
+cmp-tensor-test)
+    s=${1:-300}; need tc-stress
+    box "TENSOR-CORE EXACTNESS  (compute test, $s s)" "$(now)" \
+        "Card|$cardline" \
+        "What it does|Runs int8 and fp16 tensor-core matrix multiplications on every SM and compares each result with an exactly computed reference. Errors are counted per SM." \
+        "Pass if|\"SMs with errors: 0, total errors: 0\" with every SM exercised (\"RESULT: PASS\")." \
+        "Output|a status line every 10 s: time, checks done so far, errors so far" \
+        "Safety|$safety" \
+        "Command|tc-stress $s both" "Source|src/tc-stress.cu"
+    f=tensor-test-$STAMP.txt
+    run "$f" tensor-test $((s + 120)) ./tc-stress "$s" both
+    was_stopped "Tensor-core test ${s}s" "$f"
+    sum=$(grep -E '^SMs exercised' "$RUN/$f" | tail -1)
+    if grep -qx 'RESULT: PASS' "$RUN/$f"; then pass_banner "tensor cores: $sum"; record "Tensor-core test ${s}s" PASS "$sum, $(peaks "$f")"
+    else fail_banner "tensor cores: ${sum:-no result} $(stopreason "$f")"; record "Tensor-core test ${s}s" FAIL "${sum:-no result} $(stopreason "$f")"; fi
+    ;;
+# ------------------------------------------------------------------------------------------------
+cmp-sm-test)
+    need sm-verify; base=${CMP_SM_BASELINE:-$ROOT/baselines/sm-verify-ga100.bin}
+    box "SM BIT-EXACT CHECK  (compute test)" "$(now)" \
+        "Card|$cardline" \
+        "What it does|Runs a fixed calculation (tensor-core fp16, a long FP32 FMA chain, integer mixing, shared memory) in 16384 blocks spread over every SM, five times, and compares the per-block results bit-for-bit with each other and with a baseline recorded on a known-good CMP 170HX." \
+        "Pass if|\"0 run-to-run mismatches\" and \"0 / 16384 blocks differ\" from the baseline (\"RESULT: PASS\")." \
+        "Duration|under a minute" "Safety|$safety" \
+        "Command|sm-verify check ${base/#$ROOT\//}" "Source|src/sm-verify.cu"
+    f=sm-test-$STAMP.txt
+    run "$f" sm-test 300 ./sm-verify check "$base"
+    was_stopped "SM bit-exact check" "$f"
+    sum=$(grep -E '^vs baseline' "$RUN/$f" | tail -1)
+    if grep -q '^RESULT: PASS' "$RUN/$f"; then pass_banner "SM check: $sum"; record "SM bit-exact check" PASS "$sum"
+    else fail_banner "SM check: ${sum:-no result} $(stopreason "$f")"; record "SM bit-exact check" FAIL "${sum:-no result} $(stopreason "$f")"; fi
+    ;;
+# ------------------------------------------------------------------------------------------------
+cmp-ai-test)
+    need weight-readback "weight-readback LLAMA_DIR=/path/to/llama.cpp"
+    [[ -n $MODEL && -f $MODEL ]] || { echo "${RED}set CMP_MODEL to a GGUF file that fits on one card (in config.sh or the environment)${N}"; exit 1; }
+    mname=$(basename "$MODEL"); msize=$(( $(stat -c %s "$MODEL") / 1000000000 ))
+    box "REAL AI WORKLOAD + WEIGHT READBACK  (llama.cpp, $mname)" "$(now)" \
+        "Card|$cardline" \
+        "What it does|1) Host-RAM check (CPU only): reads the ${msize} GB model file through system RAM and straight from disk and compares every byte, so a bad cell in non-ECC system RAM is not blamed on the GPU. 2) Loads the model onto this card only with llama.cpp and asks it to complete \"The capital of France is\". 3) Reads every model weight back out of the card's memory and compares it byte-for-byte with the file on disk (read with O_DIRECT, bypassing system RAM)." \
+        "Pass if|Host RAM clean, no NaN in the output scores, top answer \"$EXPECT\", and 0 bytes of weights differ." \
+        "Safety|$safety" \
+        "Commands|model-cache-check.py <model>;  weight-readback <model>" \
+        "Source|src/weight-readback.cpp, scripts/model-cache-check.py"
+    f=ai-test-$STAMP.txt
+    printf " ${B}1) host RAM check${N}\n"
+    "$ROOT/scripts/model-cache-check.py" "$MODEL" 2>&1 | tee -i "$RUN/ai-host-ram-$STAMP.txt"; crc=${PIPESTATUS[0]}
+    (( stopped )) && { record "AI workload + readback" STOPPED "stopped during the host RAM check"; exit 0; }
+    printf "\n ${B}2+3) load the model on the card, ask the question, read every weight back${N}\n"
+    ( cd "$BIN" && exec "$ROOT/scripts/guard.sh" ai-test 600 bash -c "exec ./weight-readback '$MODEL' 2>>'$RUN/ai-llama-log-$STAMP.txt'" ) \
+        > >(tee -i "$RUN/$f" | awk '/MISMATCH/ { if (++m > 10) { if (m == 11) print "  ... (more mismatches in the saved log)"; next } } { print; fflush() }') 2>&1 &
+    GP=$!; wait $GP; while kill -0 $GP 2>/dev/null; do wait $GP; done; sleep 0.5
+    was_stopped "AI workload + readback" "$f"
+    lg=$(grep -E '^logits' "$RUN/$f" | tail -1); cb=$(grep -E '^corrupted' "$RUN/$f" | tail -1)
+    if grep -qF "top token '$EXPECT'" "$RUN/$f" && grep -qE '^logits: 0 non-finite' "$RUN/$f" && grep -q 'all GPU weights match the file' "$RUN/$f"; then
+        pass_banner "AI workload: answer '$EXPECT', no NaN, all weights match the file"; record "AI workload + readback" PASS "${lg#logits: }; ${cb#corrupted: }"
+    else
+        fail_banner "AI workload: ${lg:-no logits} / ${cb:-no readback} $(stopreason "$f")"; record "AI workload + readback" FAIL "${lg:-no logits}; ${cb:-no readback}"
+        (( crc )) && warn_banner "the host RAM check also failed - a weight difference may come from system RAM, not the card" NOTE
+    fi
+    ;;
+# ------------------------------------------------------------------------------------------------
+cmp-hbm-map)
+    m=${1:-5}; need hbm-map
+    box "HBM ERROR MAP  (diagnostic for a failing card, $m min)" "$(now)" \
+        "Card|$cardline" \
+        "What it does|Allocates the free VRAM as fixed 2 MiB physical blocks (CUDA virtual memory API) and keeps the SAME physical memory for the whole run, while running the walking-bit -> random step test over it. Logs every bad word with the block it lives in, and counts how often each block fails." \
+        "Why|Answers whether bad memory can be quarantined (reserving a few bad blocks, as some owners do): that works only if errors repeat in the SAME few blocks. Errors spread over many blocks, or clustered at the start of each GPU launch, point to a timing/power fault that quarantine cannot fix." \
+        "Read|\"handles with errors\" (how much VRAM is affected), \"failing in >=2 rounds\" (repeats), and \"covering 99% ... needs N handles\" (what quarantine would cost)." \
+        "Safety|$safety. A failing card may crash its firmware (Xid 119/62); it then needs a full power-off." \
+        "Command|hbm-map $m 1024 40 <run folder>/hbm-map-$STAMP" "Source|src/hbm-map.cu"
+    f=hbm-map-$STAMP.txt
+    run "$f" hbm-map $((m * 60 + 240)) ./hbm-map "$m" 1024 40 "$RUN/hbm-map-$STAMP"
+    was_stopped "HBM error map ${m}m" "$f"
+    res=$(grep -E '^RESULT' "$RUN/$f" | tail -1); hs=$(grep -E 'handles with errors' "$RUN/$f" | tail -1)
+    if [[ $res == "RESULT: PASS" ]]; then pass_banner "no HBM errors found"; record "HBM error map ${m}m" PASS "no errors"
+    else fail_banner "${res:-no result}"; record "HBM error map ${m}m" FAIL "${hs:-${res:-no result}}"; fi
+    printf " Per-block CSVs: %s/hbm-map-%s-{blocks,handles}.csv\n" "$RUN" "$STAMP"
+    ;;
+# ------------------------------------------------------------------------------------------------
+cmp-kernel-check)
+    box "KERNEL LOG CHECK" "$(now)" \
+        "Card|$cardline" \
+        "What it does|Searches the Linux kernel log since the first test today ($START) for GPU error reports (NVIDIA Xid) from this card: firmware (GSP/PMU) crashes, memory faults, resets." \
+        "Pass if|0 Xid reports for PCI ${CARD_BDF%.*} since $START." \
+        "Command|journalctl -k --since \"$START\" | grep \"Xid (PCI:${CARD_BDF%.*})\""
+    xs=$(xid_count "$START")
+    journalctl -k --since "$START" --no-pager 2>/dev/null | grep -E "Xid \(PCI:${CARD_BDF%.*}\)" | head -15 | tee "$RUN/kernel-check-$STAMP.txt"
+    printf " Xid reports for this card since %s: ${B}%s${N}\n" "$START" "$xs"
+    if [[ $xs == 0 ]]; then pass_banner "0 kernel GPU error reports since $START"; record "Kernel log check" PASS "0 Xid since $START"
+    else fail_banner "$xs Xid reports for this card since $START"; record "Kernel log check" FAIL "$xs Xid"; fi
+    ;;
+# ------------------------------------------------------------------------------------------------
+cmp-summary)
+    echo; printf "${CYN}"; line ═
+    printf " ${B}TEST SUMMARY  ·  NVIDIA CMP 170HX  SN %s  ·  %s${N}${CYN}\n" "$CARD_SERIAL" "$(date '+%d %b %Y')"
+    line ═; printf "${N}"
+    if [[ ! -s $RUN/results.tsv ]]; then echo " no tests recorded today"; exit 0; fi
+    fails=0
+    while IFS=$'\t' read -r t name res info; do
+        case $res in PASS) c=$GRN ;; STOPPED) c=$YEL ;; *) c=$RED; fails=$((fails + 1)) ;; esac
+        printf " %s  %-22s ${c}%-7s${N} %s\n" "$t" "$name" "$res" "${info:0:$((W - 40))}"
+    done < "$RUN/results.tsv"
+    printf "${DIM}"; line ─; printf "${N}"
+    if (( fails )); then printf " ${RED}${B}%d test(s) FAILED${N}\n" "$fails"; else printf " ${GRN}${B}All tests passed${N}\n"; fi
+    printf " Raw output of every test: %s\n" "$RUN"
+    ;;
+esac
