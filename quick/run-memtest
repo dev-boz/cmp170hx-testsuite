@@ -1,0 +1,57 @@
+#!/bin/bash
+# run-memtest <bus, two hex digits>: memtest_vulkan's standard 5-minute test on ONE named card.
+#
+# memtest_vulkan only reads its device number from a real terminal: from a pipe or file it silently tests
+# the first device it finds. So it runs on a pseudo-terminal from `script`, and its own "Standard 5-minute
+# test of N: Bus=..." line must name our card, or everything is killed at once. Exit: 0 passed, 1 errors
+# found, 125 could not run (no Vulkan, no `script`, card not listed, wrong card chosen).
+# Run it as its own session leader (setsid): stopping means signalling the whole process group.
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+bus=$1
+end() {   # stop memtest and everything it started, then leave with status $1
+    trap '' TERM INT
+    kill -INT "${SP:-0}" 2>/dev/null; sleep 2
+    kill -TERM -- -$$ 2>/dev/null; sleep 1
+    pkill -KILL -g $$ -x memtest_vulkan 2>/dev/null
+    [[ -n ${T:-} ]] && rm -rf "$T"
+    exit "$1"
+}
+trap 'end 130' TERM INT
+command -v script >/dev/null || { echo; echo "CANNOT RUN: the script command (util-linux) is not on this machine"; exit 125; }
+T=$(mktemp -d) || exit 125
+mkfifo "$T/in"; : > "$T/out"
+script -qfec "$ROOT/run-tool ./memtest_vulkan" /dev/null < "$T/in" > "$T/out" 2>&1 &
+SP=$!
+exec 3> "$T/in"
+clean() { tr '\r' '\n' < "$T/out" | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g'; }
+shown=0
+show() { local n; n=$(clean | wc -l); (( n > shown )) && { clean | tail -n +$((shown + 1)); shown=$n; }; }
+
+for (( i = 0; i < 60; i++ )); do   # the list, up to 15 s (the tool's own auto-choice comes later than that)
+    clean | grep -aqE 'Override index|autoselected' && break
+    kill -0 "$SP" 2>/dev/null || break
+    sleep 0.25
+done
+show
+idx=$(clean | grep -aiE "^ *[0-9]+: Bus=0x$bus:" | head -1 | cut -d: -f1 | tr -d ' ')
+[[ -n $idx ]] || { echo; echo "CANNOT RUN: Vulkan does not list a card on bus $bus"; end 125; }
+echo "$idx" >&3
+
+for (( i = 0; i < 80; i++ )); do   # its banner must name our card before we believe anything it says
+    banner=$(clean | grep -a -m1 'Standard 5-minute test of')
+    [[ -n $banner ]] && break
+    kill -0 "$SP" 2>/dev/null || break
+    sleep 0.25
+done
+if ! grep -aiqE "Bus=0x$bus:" <<< "$banner"; then
+    echo; echo "CANNOT RUN: memtest_vulkan chose the wrong card: ${banner:-it never started}"; end 125
+fi
+echo "$banner"
+
+while :; do
+    show
+    if clean | grep -aqE 'Error found|ERRORS FOUND'; then echo "ERRORS FOUND"; end 1; fi
+    if clean | grep -aq 'Standard 5-minute test PASSed'; then echo "STANDARD TEST PASSED"; end 0; fi
+    if ! kill -0 "$SP" 2>/dev/null; then echo; echo "CANNOT RUN: memtest_vulkan stopped early"; end 125; fi
+    sleep 1
+done

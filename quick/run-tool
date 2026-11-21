@@ -1,0 +1,12 @@
+#!/bin/bash
+# Start one bundled test program through the kit's own loader and C runtime (see build.sh), so it runs on
+# any distro, old or new. The machine supplies libcuda from its NVIDIA driver, plus cuBLAS for gpu-burn if
+# it has it. The loader's library path is not inherited by children such as gpu-burn's nvidia-smi.
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+[[ -n ${CMP_QUICK_NOLOADER:-} ]] && exec "$@"
+paths=$ROOT/lib
+[[ -d $ROOT/extra/lib ]] && paths+=:$ROOT/extra/lib   # the extras pack, if it was unpacked
+for d in /usr/local/cuda/targets/x86_64-linux/lib /usr/local/cuda/lib64; do [[ -e $d/libcublas.so.12 ]] && paths+=:$d; done
+# libcuda normally comes through /etc/ld.so.cache; add the distro folders as a backstop for odd setups
+for d in /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib64 /lib64 /usr/lib; do [[ -e $d/libcuda.so.1 ]] && { paths+=:$d; break; }; done
+exec "$ROOT/lib/ld-linux-x86-64.so.2" --library-path "$paths" "$@"

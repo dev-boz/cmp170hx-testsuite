@@ -4,8 +4,18 @@ ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 BIN=$ROOT/bin
 LOG_DIR=${CMP_LOG_DIR:-$ROOT/logs}     # per-second telemetry CSVs from guard.sh
 RUNS_DIR=${CMP_RUNS_DIR:-$ROOT/runs}   # raw output of every test + results.tsv, per card per day
-declare -A BLOWERS=()                  # optional, see config.example.sh
+declare -A BLOWERS=() SLOTNAMES=()     # optional, see config.example.sh
 [[ -f $ROOT/config.sh ]] && source "$ROOT/config.sh"
+# No blowers in config.sh: optionally take tachs and slot names from a fan/thermal watcher's JSON config, if you run one
+# (format: {"slots": {"<root port>": {"tach": "<hwmon chip>:fanN", "name": "..."}}}).
+CMP_THERMAL_CONF=${CMP_THERMAL_CONF:-/etc/cmp-thermal-watch.json}
+if (( ! ${#BLOWERS[@]} )) && [[ -r $CMP_THERMAL_CONF ]]; then
+    while IFS=$'\t' read -r port tach name; do
+        [[ $tach != - ]] && BLOWERS[$port]=$tach; SLOTNAMES[$port]=$name
+    done < <(python3 -c 'import json, sys
+for p, s in json.load(open(sys.argv[1])).get("slots", {}).items():
+    if not p.startswith("_"): print(p, s.get("tach") or "-", s.get("name", p), sep="\t")' "$CMP_THERMAL_CONF" 2>/dev/null)
+fi
 
 B=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[1;31m'; GRN=$'\e[1;32m'; YEL=$'\e[1;33m'; CYN=$'\e[1;36m'; N=$'\e[0m'
 W=78   # box width
@@ -17,11 +27,12 @@ cmp_bdfs() {   # PCI addresses of every CMP 170HX (10de:20c2 8 GB board, 10de:20
         [[ $(cat "$d/vendor" 2>/dev/null) == 0x10de && $(cat "$d/device" 2>/dev/null) =~ ^0x(20c2|2082)$ ]] && basename "$d"
     done
 }
-# "it8686:fan2" (hwmon chip-name prefix : tach file) -> /sys/class/hwmon/hwmonN/fan2_input
+# "it8686:fan2" (hwmon chip name : tach file) -> /sys/class/hwmon/hwmonN/fan2_input
 resolve_tach() {
     local chip=${1%%:*} fan=${1##*:} n
     for n in /sys/class/hwmon/hwmon*/name; do
-        [[ $(cat "$n") == "$chip"* ]] && { echo "$(dirname "$n")/${fan}_input"; return; }
+        # the out-of-tree it87 appends a board ID to the name: it8686_2008090d
+        [[ $(cat "$n") =~ ^$chip(_[0-9a-f]{8})?$ ]] && { echo "$(dirname "$n")/${fan}_input"; return; }
     done
 }
 blower_tach_for() { local spec=${BLOWERS[$(root_port "$1")]:-}; [[ -n $spec ]] && resolve_tach "$spec"; }
@@ -42,7 +53,7 @@ find_card() {
     CARD_SERIAL=${CARD_SERIAL// /}; CARD_UUID=${CARD_UUID// /}; CARD_NAME=${CARD_NAME# }
     bus=${bus// /}; CARD_BDF=$(tr 'A-F' 'a-f' <<< "${bus: -12}")
     CARD_DEVID=$(cat "/sys/bus/pci/devices/$CARD_BDF/device" 2>/dev/null)
-    CARD_PORT=$(root_port "$CARD_BDF"); CARD_SLOT="root port $CARD_PORT"
+    CARD_PORT=$(root_port "$CARD_BDF"); CARD_SLOT=${SLOTNAMES[$CARD_PORT]:+${SLOTNAMES[$CARD_PORT]} slot}; CARD_SLOT=${CARD_SLOT:-root port $CARD_PORT}
     BLOWER_NAME=${BLOWERS[$CARD_PORT]:-}; BLOWER_TACH=$(blower_tach_for "$CARD_BDF")
     export CARD_IDX CARD_BDF CARD_SERIAL CARD_UUID CARD_NAME CARD_DEVID CARD_PORT CARD_SLOT BLOWER_TACH BLOWER_NAME
 }

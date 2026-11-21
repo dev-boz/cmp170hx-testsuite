@@ -6,7 +6,10 @@
 #
 # Root port of a card:   basename "$(dirname "$(readlink -f /sys/bus/pci/devices/0000:42:00.0)")"
 # Fan sensors:           grep . /sys/class/hwmon/hwmon*/name ; cat /sys/class/hwmon/hwmonN/fan*_input
-# Value format:          "<hwmon chip-name prefix>:<fanN>"  (hwmonN numbers change between boots; names don't)
+# Value format:          "<hwmon chip name>:<fanN>"  (hwmonN numbers change between boots; names don't)
+#
+# If BLOWERS is empty, a watcher config at /etc/cmp-thermal-watch.json (CMP_THERMAL_CONF) is read for tachs and
+# slot names when one exists; otherwise no blower is monitored.
 #
 # BLOWERS["0000:40:03.1"]="it8686:fan2"
 # BLOWERS["0000:00:03.1"]="it8792:fan3"

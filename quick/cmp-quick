@@ -1,0 +1,451 @@
+#!/bin/bash
+# cmp-quick: check a CMP 170HX before buying it, in about 5 minutes, on any Linux machine.
+# Nothing is installed and nothing on the machine is changed. Ships inside cmp-quick.run with its own
+# copy of the C runtime, so all it needs from the machine is the NVIDIA driver.
+#
+#   cmp-quick              identity, HBM step test, compute checks, gpu-burn, AI test: about 6 min, stops at the first failure
+#   cmp-quick --id         identity only, a few seconds, no load on the card
+#   cmp-quick --vulkan     adds memtest_vulkan's standard 5-minute test, first (independent, best just after a cold boot)
+#   cmp-quick --long       the same tests for longer, plus memtest_vulkan, about 23 min
+#   cmp-quick --serial N   pick the card, when the machine holds more than one
+#
+# Verdict: PASS, FAIL, or INCONCLUSIVE (something stopped the card being properly tested: too hot, memory
+# not unlocked, driver too old, stopped by hand). Exit status 0, 1 and 2 respectively.
+# Serials in ~/.config/cmp-quick/owned-serials (one per line) are skipped when choosing a card.
+set -u
+unset LD_PRELOAD LD_LIBRARY_PATH
+
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+BIN=$ROOT/bin
+SYSFS=${CMP_SYSFS:-/sys/bus/pci/devices}
+GPU_LIMIT=${GPU_LIMIT:-72} MEM_LIMIT=${MEM_LIMIT:-85}
+OWNED=${CMP_QUICK_OWNED:-$HOME/.config/cmp-quick/owned-serials}
+
+mode=quick want_serial=${SERIAL:-} VULKAN=0
+while (( $# )); do
+    case $1 in
+        --id) mode=id ;;
+        --long) mode=long VULKAN=1 ;;
+        --vulkan) VULKAN=1 ;;
+        --serial) want_serial=${2:-}; shift ;;
+        --serial=*) want_serial=${1#*=} ;;
+        -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option $1 (try --help)"; exit 64 ;;
+    esac
+    shift
+done
+if [[ $mode == long ]]; then HBM_S=600 TC_S=300 BURN_S=300; else HBM_S=180 TC_S=45 BURN_S=60; fi
+HBM_S=${CMP_QUICK_HBM_S:-$HBM_S} TC_S=${CMP_QUICK_TC_S:-$TC_S} BURN_S=${CMP_QUICK_BURN_S:-$BURN_S}   # for testing the kit
+
+if [[ -t 1 ]]; then
+    B=$'\e[1m' DIM=$'\e[2m' RED=$'\e[1;31m' GRN=$'\e[1;32m' YEL=$'\e[1;33m' CYN=$'\e[1;36m' N=$'\e[0m' TTY=1
+else B='' DIM='' RED='' GRN='' YEL='' CYN='' N='' TTY=0; fi
+say()  {   # to the screen, and without colour codes to the report
+    printf '%s\n' "$*"
+    [[ -n ${REPORT:-} ]] && printf '%s\n' "$*" | sed 's/\x1b\[[0-9;]*[mK]//g' >> "$REPORT"
+    return 0
+}
+rule() { say "${DIM}──────────────────────────────────────────────────────────────────────${N}"; }
+mmss() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
+
+# ---------------------------------------------------------------------------------------- find the card
+pci_cmps() {   # PCI addresses of every CMP 170HX the machine sees, driver or not
+    local d
+    for d in "$SYSFS"/*; do
+        [[ $(cat "$d/vendor" 2>/dev/null) == 0x10de && $(cat "$d/device" 2>/dev/null) =~ ^0x(20c2|2082)$ ]] && basename "$d"
+    done
+}
+if ! command -v nvidia-smi >/dev/null; then
+    echo "${RED}nvidia-smi not found: the NVIDIA driver is not installed on this machine.${N}"
+    pci=$(pci_cmps | paste -sd' '); [[ -n $pci ]] && echo "PCI does see a CMP 170HX at: $pci"
+    echo "Nothing can be tested here. Use memtest_vulkan from extras/ if the machine runs Windows, or test on your own machine."
+    exit 2
+fi
+rows=$(timeout 20 nvidia-smi --query-gpu=pci.bus_id,serial,uuid,name --format=csv,noheader 2>/dev/null | grep 'CMP 170HX')
+if [[ -z $rows ]]; then
+    echo "${RED}The NVIDIA driver reports no CMP 170HX.${N}"
+    pci=$(pci_cmps | paste -sd' ')
+    if [[ -n $pci ]]; then
+        echo "PCI sees one at: $pci, so the card is present but the driver is not running it."
+        echo "Bad signs: a crashed card (nvidia-smi says 'GPU requires reset') needs a full power-off to recover."
+        timeout 20 nvidia-smi 2>&1 | tail -15
+    else echo "PCI sees no CMP 170HX either: check the card is seated and powered."; fi
+    exit 2
+fi
+if [[ -n $want_serial ]]; then
+    sel=$(grep -F ", $want_serial," <<< "$rows")
+    [[ -n $sel ]] || { echo "${RED}no CMP 170HX with serial $want_serial${N}"; echo "$rows"; exit 64; }
+else
+    sel=$rows
+    if (( $(grep -c . <<< "$rows") > 1 )) && [[ -r $OWNED ]]; then
+        new=$(grep -vFf <(grep . "$OWNED" | sed 's/.*/, &,/') <<< "$rows")   # match the serial column only
+        [[ -n $new ]] && sel=$new
+    fi
+    if (( $(grep -c . <<< "$sel") > 1 )); then
+        echo "${B}More than one CMP 170HX here. Which one?${N}"
+        i=0; while IFS=',' read -r bus ser _; do i=$((i + 1)); printf '  %d) serial %s at %s\n' "$i" "${ser// /}" "${bus// /}"; done <<< "$sel"
+        [[ -t 0 ]] || { echo "run again with --serial <serial>"; exit 64; }
+        read -r -p "Number: " pick
+        [[ $pick =~ ^[0-9]+$ ]] && sel=$(sed -n "${pick}p" <<< "$sel") || sel=""
+        [[ -n $sel ]] || { echo "no such card"; exit 64; }
+    fi
+fi
+IFS=',' read -r CARD_BUS CARD_SERIAL CARD_UUID CARD_NAME <<< "$sel"
+CARD_BUS=${CARD_BUS// /} CARD_SERIAL=${CARD_SERIAL// /} CARD_UUID=${CARD_UUID// /} CARD_NAME=${CARD_NAME# }
+CARD_BDF=$(tr 'A-F' 'a-f' <<< "${CARD_BUS: -12}")
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$CARD_UUID   # the UUID can't pick the wrong card
+
+# ------------------------------------------------------------------------------------------- results
+STAMP=$(date +%Y%m%d-%H%M%S)
+RUN=""
+for base in "${CMP_QUICK_OUT:-}" "$HOME" /tmp; do
+    [[ -n $base ]] || continue
+    if mkdir -p "$base/cmp-quick-results/$CARD_SERIAL-$STAMP" 2>/dev/null && touch "$base/cmp-quick-results/$CARD_SERIAL-$STAMP/report.txt" 2>/dev/null; then
+        RUN=$base/cmp-quick-results/$CARD_SERIAL-$STAMP; break
+    fi
+done
+REPORT=${RUN:+$RUN/report.txt}
+[[ -n $RUN ]] || echo "${YEL}Nowhere writable for results: this run is on screen only. Take a photo of the verdict.${N}"
+save() { [[ -n $RUN ]] && echo "$RUN/$1" || echo /dev/null; }
+
+RESULTS=() FAILS=() DOUBTS=() NOTES=()
+result() {   # result <test> <PASS|FAIL|INCONCLUSIVE|SKIPPED> <detail>
+    local c=$GRN; case $2 in FAIL) c=$RED; FAILS+=("$1: $3") ;; INCONCLUSIVE) c=$YEL; DOUBTS+=("$1: $3") ;; SKIPPED) c=$DIM ;; esac
+    RESULTS+=("$(printf ' %-20s %s%-13s%s %s' "$1" "$c" "$2" "$N" "$3")")
+    say "$(printf '   %s%s%s  %s' "$c" "$2" "$N" "$3")"
+}
+
+# ---------------------------------------------------------------------------------------- kernel log
+klog() {   # the kernel log of this boot; status 1 if this user can't read it
+    local out
+    out=$(journalctl -k -b --no-pager 2>/dev/null)
+    (( $(grep -c . <<< "$out") >= 20 )) || out=$(dmesg 2>/dev/null)
+    (( $(grep -c . <<< "$out") >= 20 )) || return 1
+    printf '%s\n' "$out"
+}
+xid_lines() { klog | grep -E "Xid \(PCI:${CARD_BDF%.*}\)"; }
+xid_codes() { grep -oE '\): [0-9]+' | awk '{print $2}' | sort -n | uniq -c | awk '{printf "%sXid %s x%s", (NR > 1 ? ", " : ""), $2, $1}'; }
+KLOG_OK=1; klog >/dev/null || KLOG_OK=0
+
+# ------------------------------------------------------------------------------------------ identity
+query_card() {
+    IFS=',' read -r Q_VBIOS Q_MEM Q_USED Q_DRV Q_LG Q_LW Q_LGM Q_LWM Q_PL Q_CORE Q_HBM < <(
+        timeout 20 nvidia-smi -i "$CARD_UUID" --format=csv,noheader,nounits \
+            --query-gpu=vbios_version,memory.total,memory.used,driver_version,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max,power.limit,temperature.gpu,temperature.memory 2>/dev/null | sed 's/, */,/g')
+}
+query_card
+devid=$(cat "$SYSFS/$CARD_BDF/device" 2>/dev/null)
+WANT_MEM=65536 STOCK=8 FULL=64; [[ $devid == 0x2082 ]] && WANT_MEM=40960 STOCK=10 FULL=40
+others=$(( $(grep -c . <<< "$rows") - 1 ))
+
+echo
+say "${CYN}${B} CMP 170HX QUICK CHECK${N}  ${DIM}$(date '+%d %b %Y %H:%M')  on $(hostname 2>/dev/null)${N}"
+rule
+say " ${B}Serial         $CARD_SERIAL${N}   ${YEL}<- compare with the sticker on the card${N}"
+say " UUID           $CARD_UUID"
+say " PCI            $CARD_BDF ${devid:+(10de:${devid#0x})}$( (( others > 0 )) && echo "   + $others other CMP in this machine")"
+say " VBIOS, driver  $Q_VBIOS, $Q_DRV   kernel $(uname -r)"
+say " Memory         $Q_MEM MiB (used $Q_USED)"
+say " PCIe           now Gen$Q_LG x$Q_LW, max Gen$Q_LGM x$Q_LWM"
+say " Power limit    $Q_PL W    idle: core ${Q_CORE}C, HBM ${Q_HBM}C"
+if (( KLOG_OK )); then
+    pre=$(xid_lines); npre=$(grep -c . <<< "$pre")
+    if (( npre )); then say " Kernel errors  ${RED}$(xid_codes <<< "$pre") this boot, before this test${N}"; else say " Kernel errors  none this boot"; fi
+    PRE_XID=$npre
+else
+    say " Kernel errors  ${YEL}can't read the kernel log as this user (sudo would allow it)${N}"; PRE_XID=0
+fi
+rule
+[[ -n $RUN ]] && timeout 20 nvidia-smi -i "$CARD_UUID" -q > "$RUN/nvidia-smi-q.txt" 2>&1
+HOST_CUDA_DIR=""
+for d in ${CMP_QUICK_CUBLAS_DIRS:-/usr/local/cuda/targets/x86_64-linux/lib /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu /usr/lib64}; do
+    [[ -e $d/libcublas.so.12 ]] && { HOST_CUDA_DIR=$d; break; }
+done
+
+# ---------------------------------------------------------------------------- identity checks: verdict inputs
+memv=${Q_MEM//[^0-9]/}
+if [[ ${memv:-0} -lt $((WANT_MEM - 512)) ]]; then
+    NOT_UNLOCKED=1
+    say " ${YEL}${B}Only ${memv:-?} MiB visible: this machine is not running the unlock.${N}"
+    say " ${YEL}The rest of the $FULL GB can't be tested here. Test on a machine with the unlock before paying the $FULL GB price.${N}"
+else NOT_UNLOCKED=0; fi
+if [[ ${Q_LW:-16} =~ ^[0-9]+$ ]] && (( Q_LW < 16 )); then
+    NOTES+=("PCIe x$Q_LW: normal for a stock board without the cap mod; it only limits transfer speed")
+fi
+(( KLOG_OK )) || NOTES+=("kernel log unreadable, so Xid errors were not checked; a crash still shows in the tests")
+
+verdict() {
+    local rc=0 r
+    echo | tee -a "${REPORT:-/dev/null}"
+    say "${CYN}${B} RESULT${N}  ${B}SN $CARD_SERIAL${N}  ${DIM}${CARD_NAME}, ${memv} MiB, $(date '+%d %b %Y %H:%M')${N}"
+    rule
+    for r in "${RESULTS[@]}"; do say "$r"; done
+    rule
+    if (( ${#FAILS[@]} )); then
+        rc=1
+        say " ${RED}${B}██ FAIL ██  Do not pay for this card as working.${N}"
+        for r in "${FAILS[@]}"; do say "   $r"; done
+        say " ${DIM}Could a faulty machine explain it? Only a pass on another machine would show that.${N}"
+    elif (( ${#DOUBTS[@]} )); then
+        rc=2
+        say " ${YEL}${B}██ INCONCLUSIVE ██  Not proven good. Nothing failed, but the test wasn't complete:${N}"
+        for r in "${DOUBTS[@]}"; do say "   $r"; done
+    elif [[ $mode == id ]]; then
+        say " ${GRN}${B}Right card, right memory size.${N} ${YEL}${B}NOT TESTED YET: run without --id to test it.${N}"
+    else
+        say " ${GRN}${B}██ PASS ██  No faults found.${N}"
+    fi
+    for r in "${NOTES[@]}"; do say " ${DIM}Note: $r${N}"; done
+    say " ${B}Before you pay: the serial on the sticker must read $CARD_SERIAL${N}"
+    [[ -n $RUN ]] && say " ${DIM}Saved: $RUN${N}" || say " ${YEL}Nothing saved: take a photo of this screen.${N}"
+    exit $rc
+}
+
+if [[ $mode == id ]]; then
+    if (( NOT_UNLOCKED )); then result Memory INCONCLUSIVE "only $memv MiB visible, $FULL GB unlock not running here"
+    else result Memory PASS "$memv MiB"; fi
+    (( PRE_XID )) && result "Kernel log" INCONCLUSIVE "$(xid_lines | xid_codes) this boot, before any test"
+    (( KLOG_OK && !PRE_XID )) && result "Kernel log" PASS "no Xid errors this boot"
+    verdict
+fi
+
+# ---------------------------------------------------------------------------- is the card free to test?
+apps=$(timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>/dev/null | grep -F "$CARD_UUID")
+if [[ -n $apps || ${Q_USED//[^0-9]/} -gt 1024 ]]; then
+    say " ${RED}${B}The card is in use, so its memory can't all be tested. Stop these first, then run this again:${N}"
+    while IFS=',' read -r _ pid name mem; do [[ -n ${pid:-} ]] && say "   pid$pid $name ($mem )"; done <<< "$apps"
+    say "   VRAM used now: $Q_USED MiB"
+    exit 2
+fi
+
+# -------------------------------------------------------------------------------------------- run a test
+GP=0 INTERRUPTED=0
+stop_tool() { (( GP )) && kill -0 "$GP" 2>/dev/null || return 0; kill -TERM -- -"$GP" 2>/dev/null; sleep 2; kill -KILL -- -"$GP" 2>/dev/null; }
+cleanup() { stop_tool; }
+trap 'INTERRUPTED=1' INT
+trap 'INTERRUPTED=1; stop_tool' HUP TERM
+trap cleanup EXIT
+
+# run_test <logname> <max-s> <fail-regex> <progress-seconds> command...
+# Sets T_WHY (empty, hot, lost, bad, time, interrupted), T_RC, T_LOG, T_PEAK.
+run_test() {
+    local name=$1 maxs=$2 failre=$3 plan=$4 line now el misses=0 core=? hbm=? pw=? load=? gt mt p u errs; shift 4
+    T_LOG=$(save "$name.txt"); [[ -n $RUN ]] || T_LOG=$(mktemp)
+    local csv; csv=$(save "$name-telemetry.csv"); echo "t_s,core_c,hbm_c,power_w,load_pct" > "$csv"
+    local pk=0 pkm=0 pkw=0 t0; t0=$(date +%s)
+    T_WHY=""
+    local launcher="$ROOT/run-tool"; [[ $1 == */run-memtest ]] && launcher=""   # that one is a script, it starts its own
+    ( cd "$BIN" && exec setsid $launcher "$@" ) > "$T_LOG" 2>&1 &
+    GP=$!
+    while kill -0 "$GP" 2>/dev/null; do
+        if (( INTERRUPTED )); then T_WHY=interrupted; break; fi
+        now=$(date +%s); el=$((now - t0))
+        line=$(timeout 5 nvidia-smi -i "$CARD_UUID" --format=csv,noheader,nounits --query-gpu=temperature.gpu,temperature.memory,power.draw,utilization.gpu,power.limit 2>/dev/null)
+        IFS=', ' read -r gt mt p u pl <<< "$line"
+        if [[ $gt =~ ^[0-9]+$ ]]; then
+            misses=0; core=$gt hbm=$mt pw=${p%.*} load=$u
+            (( gt > pk )) && pk=$gt
+            [[ $mt =~ ^[0-9]+$ ]] && (( mt > pkm )) && pkm=$mt
+            [[ $pw =~ ^[0-9]+$ ]] && (( pw > pkw )) && pkw=$pw
+            echo "$el,$gt,$mt,$p,$u" >> "$csv"
+            if (( gt >= GPU_LIMIT )); then T_WHY=hot; T_HOT="core ${gt}C reached the ${GPU_LIMIT}C limit"; break; fi
+            if [[ $mt =~ ^[0-9]+$ ]] && (( mt >= MEM_LIMIT )); then T_WHY=hot; T_HOT="HBM ${mt}C reached the ${MEM_LIMIT}C limit"; break; fi
+        else
+            misses=$((misses + 1)); (( misses >= 3 )) && { T_WHY=lost; break; }
+        fi
+        if [[ -n $failre ]] && grep -aqE "$failre" "$T_LOG"; then T_WHY=bad; break; fi
+        # Something (a fan watcher, a script) cut the power limit: the card is no longer being tested at full load.
+        if [[ ${pl%.*} =~ ^[0-9]+$ && ${Q_PL%.*} =~ ^[0-9]+$ ]] && (( ${pl%.*} < ${Q_PL%.*} - 5 )); then
+            T_WHY=capped; T_CAP="power limit cut from ${Q_PL%.*} W to ${pl%.*} W during the test, by something on this machine"; break
+        fi
+        if (( el >= maxs )); then T_WHY=time; break; fi
+        if (( TTY )); then
+            printf '\r   %s / %s   core %sC  HBM %sC  %sW  load %s%%   \e[K' "$(mmss "$el")" "$(mmss "$plan")" "$core" "$hbm" "$pw" "$load"
+        fi
+        sleep 1
+    done
+    (( TTY )) && printf '\r\e[K'
+    [[ -n $T_WHY ]] && stop_tool
+    local w; for (( w = 0; w < 15; w++ )); do kill -0 "$GP" 2>/dev/null || break; sleep 1; done   # a crashed card can hang its program
+    if kill -0 "$GP" 2>/dev/null; then T_RC=124; else wait "$GP" 2>/dev/null; T_RC=$?; fi
+    GP=0
+    T_PEAK="peak core ${pk}C, HBM ${pkm}C, ${pkw}W"
+    [[ -z $T_WHY && -n $failre ]] && grep -aqE "$failre" "$T_LOG" && T_WHY=bad
+}
+# Endings every test shares. They all finish the run; otherwise this returns and the test judges its own output.
+# A mid-run CUDA error is NOT here: that is what a crashing card looks like, so it stays a FAIL for the test.
+common_end() {   # common_end <test name>
+    case $T_WHY in
+        interrupted) result "$1" INCONCLUSIVE "stopped by hand"; verdict ;;
+        hot) result "$1" INCONCLUSIVE "stopped, too hot: $T_HOT. Check airflow, try: sudo nvidia-smi -i $CARD_UUID -pl 180"; verdict ;;
+        lost) result "$1" FAIL "the card stopped answering during the test ($T_PEAK)"; xid_report; verdict ;;
+        capped) result "$1" INCONCLUSIVE "$T_CAP"; verdict ;;
+        time) result "$1" INCONCLUSIVE "did not finish in the time allowed"; verdict ;;
+    esac
+    [[ $T_WHY == bad ]] && return 1
+    local cant='driver version is insufficient|no CUDA-capable device|initialization error|error while loading shared|cannot open shared|version .GLIBC|Exec format|No such file|Permission denied|JIT compiler library not found'
+    if (( T_RC != 0 )) && { grep -aqE "$cant" "$T_LOG" || (( T_RC == 126 || T_RC == 127 )); }; then
+        result "$1" INCONCLUSIVE "the program could not start: $(grep -aE "$cant" "$T_LOG" | head -1 | cut -c1-90)"
+        NOTES+=("these programs need NVIDIA driver 570 or newer, this machine has $Q_DRV; extras/memtest_vulkan runs on older drivers, by hand")
+        verdict
+    fi
+    return 1
+}
+xid_report() {
+    (( KLOG_OK )) || return 0
+    local now_lines n; now_lines=$(xid_lines); n=$(grep -c . <<< "$now_lines")
+    if (( n > PRE_XID )); then
+        result "Kernel log" FAIL "$(tail -n +$((PRE_XID + 1)) <<< "$now_lines" | xid_codes) during the test"
+    elif (( PRE_XID )); then
+        result "Kernel log" INCONCLUSIVE "no new errors, but $(xid_codes <<< "$now_lines") earlier this boot, from before this test"
+    else
+        result "Kernel log" PASS "no Xid errors this boot"
+    fi
+}
+stop_on_fail() { (( ${#FAILS[@]} )) && { xid_report; verdict; }; return 0; }
+STEP=0
+heading() { STEP=$((STEP + 1)); echo | tee -a "${REPORT:-/dev/null}"; say " ${B}$STEP. $1${N}  ${DIM}$2${N}"; }
+
+# ------------------------------------------------------------------------------------ the extras pack
+# cuBLAS (for gpu-burn and llama.cpp) and the AI test travel in a separate pack, unpacked only for a real run.
+EXTRAS=${CMP_QUICK_EXTRAS:-} MODEL="" AI_WHY="the extras folder isn't next to the kit"
+if [[ -n $EXTRAS && -f $EXTRAS/cmp-quick-extras.tgz ]]; then
+    free_mb=$(df -Pm "$ROOT" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    if (( ${free_mb:-0} < 1200 )); then
+        AI_WHY="only ${free_mb:-?} MB free to unpack it, needs 1200"
+    else
+        say " ${DIM}Unpacking gpu-burn and AI test files...${N}"
+        if tar xzf "$EXTRAS/cmp-quick-extras.tgz" --no-same-owner -C "$ROOT" 2>/dev/null; then
+            [[ -e $ROOT/extra/lib/libcublas.so.12 ]] && HOST_CUDA_DIR=$ROOT/extra/lib
+            model=$(ls "$EXTRAS"/*.gguf 2>/dev/null | head -1)
+            if [[ -z $model ]]; then AI_WHY="the model file is missing"
+            elif (cd "$EXTRAS" && sha256sum -c --status SHA256SUMS 2>/dev/null); then MODEL=$model; AI_WHY=""
+            else AI_WHY="the model file failed its checksum: copy the kit again"; fi
+        else
+            AI_WHY="the extras pack is damaged: copy the kit again"
+            rm -rf "$ROOT/extra"
+        fi
+    fi
+fi
+
+total=$(( HBM_S + TC_S + 40 ))
+[[ -n $HOST_CUDA_DIR ]] && total=$((total + BURN_S + 10))
+[[ -n $MODEL ]] && total=$((total + 15))
+(( VULKAN )) && total=$((total + 310))
+say " ${B}About $(( (total + 59) / 60 )) minutes.${N} Ctrl+C stops at any time. Stops itself at ${GPU_LIMIT}C core or ${MEM_LIMIT}C HBM."
+say " ${DIM}Keep an eye on the card's blower: software can't always see a stalled one.${N}"
+
+# ----------------------------------------------------------------------------------- memtest_vulkan, opt-in
+if (( VULKAN )); then
+    heading "memtest_vulkan" "independent memory test, its standard 5 minutes"
+    run_test memtest 420 'ERRORS FOUND|Error found' 300 "$ROOT/run-memtest" "${CARD_BDF:5:2}"
+    if [[ -z $T_WHY ]] && (( T_RC == 125 )); then
+        result "memtest_vulkan" SKIPPED "$(grep -a -m1 'CANNOT RUN' "$T_LOG" | sed 's/CANNOT RUN: //' | cut -c1-90)"
+    else
+        common_end "memtest_vulkan"
+        if [[ $T_WHY == bad ]] || (( T_RC == 1 )); then
+            result "memtest_vulkan" FAIL "errors found: $(grep -a -m1 -E 'Error found|ERRORS FOUND' "$T_LOG" | cut -c1-80)"
+        elif (( T_RC == 0 )) && grep -aq 'STANDARD TEST PASSED' "$T_LOG"; then
+            result "memtest_vulkan" PASS "standard 5-minute test on $(grep -a -m1 'Standard 5-minute test of' "$T_LOG" | grep -oE 'Bus=0x[0-9a-fA-F]+'), $T_PEAK"
+        else
+            result "memtest_vulkan" FAIL "no clean finish, exit $T_RC: $(tail -1 "$T_LOG" | cut -c1-80)"
+        fi
+    fi
+    stop_on_fail
+fi
+
+# ----------------------------------------------------------------------------------- HBM step test
+heading "HBM step test" "fills all free VRAM, light pattern then full-speed random data, checks every word"
+run_test hbm-step $((HBM_S + 120)) '<<<' "$HBM_S" ./vram-memtest "$(awk "BEGIN { print $HBM_S / 60 }")" 0 1024 40
+common_end "HBM step test"
+gib=$(grep -aoE 'testing [0-9]+ GiB' "$T_LOG" | head -1 | grep -oE '[0-9]+')
+need_gib=$(( memv / 1024 - 3 ))
+sum=$(grep -aE '^rounds' "$T_LOG" | tail -1)
+if [[ $T_WHY == bad ]]; then
+    first=$(grep -a -m1 '<<<' "$T_LOG" | sed -E 's/ +/ /g; s/^ //; s/ <<<//')
+    result "HBM step test" FAIL "memory errors on a ${gib:-?} GiB test, first: $first"
+    grep -a -A3 -m1 '<<<' "$T_LOG" | tail -3 | sed -E 's/^ +/     /' | tee -a "${REPORT:-/dev/null}"
+elif grep -aq 'RESULT: PASS' "$T_LOG" && (( T_RC == 0 )); then
+    if (( ${gib:-0} < need_gib )); then
+        result "HBM step test" INCONCLUSIVE "clean, but only ${gib:-0} GiB of $((memv / 1024)) could be allocated"
+    elif (( NOT_UNLOCKED )); then
+        result "HBM step test" INCONCLUSIVE "clean on the ${gib} GiB visible here; the rest of the $FULL GB is untested"
+    else
+        result "HBM step test" PASS "${gib} GiB, $(awk '{ print $2 " rounds, " $3 " " $4 " checked" }' <<< "${sum//,/}"), 0 errors, $T_PEAK"
+    fi
+else
+    result "HBM step test" FAIL "no clean finish, exit $T_RC: $(tail -1 "$T_LOG" | cut -c1-90)"
+fi
+stop_on_fail
+
+# ----------------------------------------------------------------------------------- tensor cores
+heading "Tensor cores" "int8 and fp16 matrix maths on every SM, checked against the exact answer"
+run_test tensor $((TC_S + 60)) 'errors [1-9]' "$TC_S" ./tc-stress "$TC_S" both
+common_end "Tensor cores"
+sum=$(grep -aE '^SMs exercised' "$T_LOG" | tail -1)
+sms=$(grep -aoE '[0-9]+ SMs' "$T_LOG" | head -1)
+if [[ $T_WHY == bad ]] || grep -aqE 'RESULT: FAIL' "$T_LOG"; then
+    result "Tensor cores" FAIL "$(grep -aE 'errors [1-9]' "$T_LOG" | tail -1 | sed -E 's/^ +//')"
+elif grep -aqx 'RESULT: PASS' "$T_LOG"; then
+    result "Tensor cores" PASS "${sms:-? SMs}, 0 errors, $T_PEAK"
+elif grep -aq 'RESULT: PASS' "$T_LOG"; then
+    result "Tensor cores" INCONCLUSIVE "0 errors, but not every SM was exercised: $sum"
+else
+    result "Tensor cores" FAIL "no clean finish, exit $T_RC: $(tail -1 "$T_LOG" | cut -c1-90)"
+fi
+stop_on_fail
+
+# ----------------------------------------------------------------------------------- SM bit-exact
+heading "SM bit-exact" "a fixed calculation on every SM, compared with a known-good card"
+run_test sm-verify 180 '' 30 ./sm-verify check "$ROOT/sm-verify-ga100.bin"
+common_end "SM bit-exact"
+if grep -aq '^RESULT: PASS' "$T_LOG" && (( T_RC == 0 )); then
+    result "SM bit-exact" PASS "$(grep -aE '^vs baseline' "$T_LOG" | sed 's/vs baseline: //'), 0 run-to-run mismatches"
+else
+    result "SM bit-exact" FAIL "$(grep -aE '^vs baseline|^RESULT' "$T_LOG" | paste -sd' ' | cut -c1-100)"
+fi
+stop_on_fail
+
+# ----------------------------------------------------------------------------------- gpu-burn
+if [[ -n $HOST_CUDA_DIR ]]; then
+    heading "gpu-burn" "independent stress test, heavy compute over nearly all of the memory"
+    run_test gpu-burn $((BURN_S + 120)) 'errors: *[1-9]|FAULTY' "$BURN_S" ./gpu_burn -tc -m 95% "$BURN_S"
+    common_end "gpu-burn"
+    if [[ $T_WHY == bad ]]; then
+        result "gpu-burn" FAIL "$(tr '\r' '\n' < "$T_LOG" | grep -aE 'errors: *[1-9]|FAULTY' | head -1 | cut -c1-90)"
+    elif grep -aq 'GPU 0: OK' "$T_LOG"; then
+        result "gpu-burn" PASS "$BURN_S s, 0 errors, $T_PEAK"
+    else
+        result "gpu-burn" FAIL "no OK verdict, exit $T_RC: $(tr '\r' '\n' < "$T_LOG" | tail -1 | cut -c1-90)"
+    fi
+    stop_on_fail
+else
+    result "gpu-burn" SKIPPED "no cuBLAS here and ${AI_WHY:-no extras pack}"
+fi
+
+# ----------------------------------------------------------------------------------- real AI model
+if [[ -n $MODEL ]]; then
+    heading "AI test" "a small model on real llama.cpp, then every weight read back from the card"
+    run_test ai-test 300 'MISMATCH' 15 "$ROOT/extra/bin/weight-readback" "$MODEL"
+    common_end "AI test"
+    corrupted=$(grep -aE '^corrupted' "$T_LOG" | tail -1 | sed 's/^corrupted: //')
+    logits=$(grep -aE '^logits' "$T_LOG" | tail -1 | sed 's/^logits: //')
+    size=$(grep -aoE '[0-9.]+ GB' "$T_LOG" | head -1)
+    if [[ $T_WHY == bad ]]; then
+        result "AI test" FAIL "weights in VRAM differ from the file: $(grep -a -m1 MISMATCH "$T_LOG" | sed -E 's/ +/ /g' | cut -c1-80)"
+        NOTES+=("whole 128-byte runs of wrong bytes point to the card; single bytes at one page offset point to this machine's RAM")
+    elif grep -aqF "top token ' Paris'" "$T_LOG" && grep -aqE '^logits: 0 non-finite' "$T_LOG" && grep -aq 'all GPU weights match the file' "$T_LOG"; then
+        result "AI test" PASS "answered Paris, no NaN, ${size:-all} of weights match the file"
+    else
+        result "AI test" FAIL "${logits:-no output}; ${corrupted:-no readback}; exit $T_RC"
+    fi
+    stop_on_fail
+else
+    result "AI test" SKIPPED "${AI_WHY:-no model}"
+fi
+
+# ------------------------------------------------------------------------------------ after the tests
+query_card
+if [[ ${Q_CORE:-x} =~ ^[0-9]+$ ]]; then :; else result "After the tests" FAIL "the card no longer answers the driver"; fi
+xid_report
+verdict

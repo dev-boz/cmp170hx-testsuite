@@ -21,13 +21,22 @@ or shared as evidence.
 | `cmp-kernel-check` | instant | Kernel log since the first test today: NVIDIA Xid reports (GSP/PMU crashes, faults) | 0 Xid |
 | `cmp-summary` | instant | Table of everything run today on this card | |
 | `cmp-hbm-map [min]` | 5 min | **Diagnostic for a failing card**: maps HBM errors to fixed 2 MiB physical blocks | see [below](#can-bad-memory-be-quarantined) |
-| `cmp-telemetry` | live | Live panel for a second terminal: temps, power, load, VRAM, clocks, blower rpm, Xid count | |
+| `cmp-telemetry` | live | Live panel for a second terminal, every CMP: temps, power, load, VRAM, clocks, blower rpm, Xid count | |
 
 Every command finds the card itself (the single CMP 170HX in the machine, or `SERIAL=...`), prints a box
 explaining what it does, the exact command and the pass rule, shows the tool's live output, and ends with a
 PASS / FAIL banner. GPU tests run under `scripts/guard.sh`, which stops them at 72 °C core / 85 °C HBM
 (override with `GPU_LIMIT` / `MEM_LIMIT`). Ctrl+C stops a test cleanly and is recorded as STOPPED.
 Raw output of every test goes to `runs/<serial>-<date>/`, per-second telemetry to `logs/`.
+
+## Quick check for buying a card
+
+`quick/` builds **`cmp-quick.run`**: one self-extracting file that tests a card in about 6 minutes on any Linux
+machine with an NVIDIA driver (570+), with no install and no sudo. It is made to be copied to a USB stick and
+run on a seller's machine or your own: HBM step test, tensor cores, SM check, gpu-burn, a small llama.cpp
+model and optionally memtest_vulkan, ending in one PASS / FAIL / INCONCLUSIVE verdict (a tool that can't run
+is never reported as a fail). See [quick/README.txt](quick/README.txt) for use and for building the kit;
+`quick/test.sh` checks the verdict logic against fake hardware, no GPU needed.
 
 ## Requirements
 

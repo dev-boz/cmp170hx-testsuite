@@ -12,12 +12,12 @@ set -u
 source "$(dirname "$(readlink -f "$0")")/common.sh"
 GPU_LIMIT=${GPU_LIMIT:-72}      # card spec: 85 C max operating, slowdown ~95 C
 MEM_LIMIT=${MEM_LIMIT:-85}      # HBM spec: 95 C max operating
-BLOWER_MIN=${BLOWER_MIN:-800}
+BLOWER_MIN=${BLOWER_MIN:-400}   # a stalled blower reads ~0; some fans idle well under 800 rpm
 
 name=$1; maxs=$2; shift 2
 CMPS=$(nvidia-smi --query-gpu=index,name --format=csv,noheader | awk -F', ' '/CMP 170HX/{print $1}' | paste -sd,)
 [[ -n $CMPS ]] || { echo "guard: no CMP 170HX found" >&2; exit 2; }
-tachs=(); for bdf in $(cmp_bdfs); do t=$(blower_tach_for "$bdf"); [[ -n $t ]] && tachs+=("$t"); done
+tachs=(); for bdf in $(cmp_bdfs); do t=$(blower_tach_for "$bdf"); [[ -n $t && " ${tachs[*]} " != *" $t "* ]] && tachs+=("$t"); done   # cards may share a fan
 
 mkdir -p "$LOG_DIR"
 log=$LOG_DIR/$name-$(date +%Y%m%d-%H%M%S).csv
